@@ -5,7 +5,7 @@ export async function POST(request: NextRequest) {
     return await new Query({
         query: 'roles',
         params: [
-            { name: 'userGuid', required: true }
+            { name: 'guid', required: true }
         ]
     }).executeWithRequest(request);
 };

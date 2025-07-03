@@ -2,6 +2,7 @@ import { NextResponse, NextRequest } from "next/server";
 import { db } from '@/app/lib/db';
 import { decrypt } from "./encryption";
 import { SessionData } from "./oauth";
+import { handleError, createErrorResponse, ValidationError, AuthenticationError, DatabaseError } from "./errors";
 
 type QueryParams = {
     name: string;
@@ -23,71 +24,79 @@ export class Query {
     }
 
     async executeWithRequest(request: NextRequest) {
-        let paramValues: { [key: string]: string } = {};
-        
-        if (request.method === 'GET') {
-            // Extract parameters from URL for GET requests
-            const urlParams = request.nextUrl.searchParams;
+        try {
+            let paramValues: { [key: string]: string } = {};
             
-            // Extract all parameters from URL
-            this.params.forEach(param => {
-                const value = urlParams.get(param.name);
-                if (value !== null) {
-                    paramValues[param.name] = value;
-                }
-            });
-        } else if (request.method === 'POST') {
-            // Extract parameters from JSON body for POST requests
-            try {
-                const body = await request.json();
+            if (request.method === 'GET') {
+                // Extract parameters from URL for GET requests
+                const urlParams = request.nextUrl.searchParams;
                 
-                // Extract all parameters from body
+                // Extract all parameters from URL
                 this.params.forEach(param => {
-                    if (body[param.name] !== undefined) {
-                        paramValues[param.name] = String(body[param.name]);
+                    const value = urlParams.get(param.name);
+                    if (value !== null) {
+                        paramValues[param.name] = value;
                     }
                 });
-            } catch (error) {
-                return NextResponse.json(
-                    { error: 'Invalid JSON body' }, 
-                    { status: 400 }
-                );
+            } else if (request.method === 'POST') {
+                // Extract parameters from JSON body for POST requests
+                try {
+                    const body = await request.json();
+                    
+                    // Extract all parameters from body
+                    this.params.forEach(param => {
+                        if (body[param.name] !== undefined) {
+                            paramValues[param.name] = String(body[param.name]);
+                        }
+                    });
+                } catch (error) {
+                    throw new ValidationError('Invalid JSON body');
+                }
+            } else {
+                throw new ValidationError(`Method ${request.method} not supported`);
             }
-        } else {
-            return NextResponse.json(
-                { error: `Method ${request.method} not supported` }, 
-                { status: 405 }
-            );
-        }
 
-        // Get session cookie and ensure it exists
-        const sessionCookie = request.cookies.get('session')?.value;
-        const userParams: {
-            userGUID: string | null,
-            userRoles: string | null,
-            userGroups: string | null
-        } = {
-            userGUID: null,
-            userRoles: null,
-            userGroups: null
-        };
+            // Get session cookie and ensure it exists
+            const sessionCookie = request.cookies.get('session')?.value;
+            const userParams: {
+                userGUID: string | null,
+                userRoles: string | null,
+                userGroups: string | null
+            } = {
+                userGUID: null,
+                userRoles: null,
+                userGroups: null
+            };
 
-        if (sessionCookie) {
-            const sessionData = await decrypt(sessionCookie);
-            const { user_roles, user_groups, sub } = JSON.parse(sessionData) as SessionData;
-            userParams.userGUID = sub;
-            userParams.userRoles = user_roles;
-            userParams.userGroups = user_groups;
-        }
+            if (sessionCookie) {
+                try {
+                    const sessionData = await decrypt(sessionCookie);
+                    const { user_roles, user_groups, sub } = JSON.parse(sessionData) as SessionData;
+                    userParams.userGUID = sub;
+                    userParams.userRoles = user_roles;
+                    userParams.userGroups = user_groups;
+                } catch (error) {
+                    throw new AuthenticationError('Invalid session data');
+                }
+            }
 
-        try {
             const result = await this.execute(paramValues, userParams);
             return NextResponse.json(result, { status: 200 });
         } catch (error) {
-            console.error('Error executing query:', error);
+            const appError = handleError(error);
+            
+            // Log the error for debugging
+            console.error('Query execution error:', {
+                message: appError.message,
+                statusCode: appError.statusCode,
+                stack: appError.stack,
+                path: request.nextUrl.pathname,
+                method: request.method
+            });
+
             return NextResponse.json(
-                { error: error instanceof Error ? error.message : 'Unknown error' }, 
-                { status: 500 }
+                createErrorResponse(appError, request.nextUrl.pathname),
+                { status: appError.statusCode }
             );
         }
     }
@@ -100,13 +109,22 @@ export class Query {
                 .filter(param => !params[param.name]);
                 
             if (missingParams.length > 0) {
-                throw new Error(`Missing required parameters: ${missingParams.map(p => p.name).join(', ')}`);
+                throw new ValidationError(`Missing required parameters: ${missingParams.map(p => p.name).join(', ')}`);
             }
 
             const result = await db.queryFromPath(this.config.query, { ...params, ...userParams });
             return result;
         } catch (error) {
-            // console.error('Error executing query:', error);
+            if (error instanceof Error) {
+                // Re-throw validation errors as-is
+                if (error instanceof ValidationError) {
+                    throw error;
+                }
+                // Wrap database errors
+                if (error.message.includes('Database') || error.message.includes('connection')) {
+                    throw new DatabaseError(error.message);
+                }
+            }
             throw error;
         }
     }

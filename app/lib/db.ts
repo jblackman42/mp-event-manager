@@ -38,7 +38,14 @@ export const db = {
         requestTimeout: 30000
       }
     };
-    this.pool = await sql.connect(config);
+    
+    try {
+      this.pool = await sql.connect(config);
+      console.log('Database connection established successfully');
+    } catch (error) {
+      console.error('Failed to connect to database:', error);
+      throw new Error(`Database connection failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   },
 
   close: async function(): Promise<void> {
@@ -82,11 +89,25 @@ export const db = {
   },
   query: async function (queryString: string, params: { [key: string]: any } = {}): Promise<IResult<any>> {
     await this.ensureConnection();
-    const request = this.pool!.request();
-    for (const key in params) {
-      request.input(key, params[key]);
+    
+    if (!this.pool) {
+      throw new Error('Database connection not available');
     }
-    return await request.query(queryString);
+    
+    try {
+      const request = this.pool.request();
+      for (const key in params) {
+        request.input(key, params[key]);
+      }
+      return await request.query(queryString);
+    } catch (error) {
+      console.error('Database query failed:', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        query: queryString.substring(0, 100) + '...',
+        params: Object.keys(params)
+      });
+      throw new Error(`Database query failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   },
   queryFromPath: async function <T>(filePath: string, params: { [key: string]: any } = {}): Promise<T[]> {
     try {

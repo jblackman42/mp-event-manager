@@ -113,84 +113,166 @@ export async function getOAuthConfig(): Promise<OAuthConfig> {
       throw new Error('NEXT_PUBLIC_DISCOVER_URL environment variable is not set');
     }
     
-    const response = await fetch(discoverUrl);
-    if (!response.ok) {
-      throw new Error('Failed to fetch OAuth config');
+    try {
+      const response = await fetch(discoverUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch OAuth config: ${response.status} ${response.statusText}`);
+      }
+      
+      const data = await response.json() as OAuthConfig;
+      
+      // Validate required fields
+      if (!data.authorization_endpoint || !data.token_endpoint || !data.userinfo_endpoint) {
+        throw new Error('Invalid OAuth configuration: missing required endpoints');
+      }
+      
+      currOAuthConfig = data;
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error('Failed to fetch OAuth configuration');
     }
-    
-    const data = await response.json() as OAuthConfig;
-    currOAuthConfig = data;
-    return currOAuthConfig;
   }
   return currOAuthConfig;
+}
+
+export async function getJWKSUri(): Promise<string | null> {
+  try {
+    const config = await getOAuthConfig();
+    return config.jwks_uri || null;
+  } catch (error) {
+    console.error('Failed to get JWKS URI:', error);
+    return null;
+  }
 }
 
 export async function getToken(code: string, redirectUri: string) {
     const { token_endpoint } = await getOAuthConfig();
     
     const clientId = process.env.NEXT_PUBLIC_CLIENT_ID || process.env.CLIENT_ID;
+    const clientSecret = process.env.CLIENT_SECRET;
+    
+    if (!clientId || !clientSecret) {
+      throw new Error('OAuth client credentials not configured');
+    }
     
     const formData = {
       client_id: clientId,
-      client_secret: process.env.CLIENT_SECRET,
+      client_secret: clientSecret,
       grant_type: 'authorization_code',
       redirect_uri: redirectUri,
       code: code
     };
 
-    const response = await fetch(token_endpoint, {
-      method: "POST",
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: encodeUrlForm(formData)
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      // console.error('Token exchange failed:', response.status, errorText);
-      throw new Error(`Failed to get token: ${response.status} ${errorText}`);
+    try {
+      const response = await fetch(token_endpoint, {
+        method: "POST",
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: encodeUrlForm(formData)
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Token exchange failed:', response.status, errorText);
+        throw new Error(`Token exchange failed: ${response.status} ${response.statusText}`);
+      }
+      
+      const tokenData = await response.json();
+      
+      // Validate required token fields
+      if (!tokenData.access_token || !tokenData.token_type) {
+        throw new Error('Invalid token response: missing required fields');
+      }
+      
+      return tokenData as TokenData;
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error('Failed to exchange authorization code for token');
     }
-    
-    return await response.json() as unknown as TokenData;
 }
 
 export async function getUser(token_type: string, access_token: string): Promise<User> {
   const { userinfo_endpoint } = await getOAuthConfig();
 
-  const response = await fetch(userinfo_endpoint, {
-    method: 'POST',
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `${token_type} ${access_token}`
+  try {
+    const response = await fetch(userinfo_endpoint, {
+      method: 'POST',
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `${token_type} ${access_token}`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to get user info: ${response.status} ${response.statusText}`);
     }
-  });
 
-  if (!response.ok) {
-    throw new Error('Failed to get user info');
+    const userData = await response.json();
+    
+    // Validate required user fields
+    if (!userData.sub || !userData.email) {
+      throw new Error('Invalid user data: missing required fields');
+    }
+    
+    return userData as User;
+  } catch (error) {
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error('Failed to retrieve user information');
   }
-
-  const userData = await response.json();
-  return userData as unknown as User;
 }
 
 export async function getUserRoles(user: User): Promise<UserRoles> {
   const { ext_User_GUID } = user;
 
-  const response = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/oauth/roles`, {
-    method: 'POST',
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ userGuid: ext_User_GUID })
-  });
-
-  if (!response.ok) {
-    throw new Error('Failed to get user roles');
+  if (!ext_User_GUID) {
+    throw new Error('User GUID is required to fetch roles');
   }
 
-  const [userRoles] = await response.json();
-  return userRoles as unknown as UserRoles;
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL;
+  if (!baseUrl) {
+    throw new Error('NEXT_PUBLIC_BASE_URL environment variable is not set');
+  }
+
+  try {
+    const response = await fetch(`${baseUrl}/api/oauth/roles`, {
+      method: 'POST',
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ guid: ext_User_GUID })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to get user roles: ${response.status} ${response.statusText}`);
+    }
+
+    const responseData = await response.json();
+    
+    if (!Array.isArray(responseData) || responseData.length === 0) {
+      throw new Error('Invalid user roles response format');
+    }
+    
+    const [userRoles] = responseData;
+    
+    // Validate the structure
+    if (!userRoles || typeof userRoles !== 'object') {
+      throw new Error('Invalid user roles data structure');
+    }
+    
+    return userRoles as UserRoles;
+  } catch (error) {
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error('Failed to retrieve user roles');
+  }
 }
 
 
@@ -232,53 +314,77 @@ export async function checkSession(sessionValue: string, request: NextRequest): 
     const sessionData = await decrypt(sessionValue);
     const parsedSessionData = JSON.parse(sessionData) as SessionData;
     const { access_token, expiry_date, refresh_token, user_roles, user_groups } = parsedSessionData;
+    
+    if (!access_token) {
+      console.warn('Session missing access token');
+      return false;
+    }
+    
     let currentToken = access_token;
 
     // if refresh token exists & access token is expired
     if (refresh_token && new Date() > new Date(expiry_date)) {
-      const newAuth: TokenData = await refreshAccessToken(refresh_token);
-      currentToken = newAuth.access_token;
-      
-      // Preserve all existing session data and only update token-related fields
-      const updatedSessionData: SessionData = {
-        ...parsedSessionData,
-        access_token: newAuth.access_token,
-        refresh_token: newAuth.refresh_token,
-        expires_in: newAuth.expires_in,
-        expiry_date: new Date(new Date().getTime() + newAuth.expires_in * 1000).toISOString(),
-      };
-      
-      const encryptedSessionData = await encrypt(JSON.stringify(updatedSessionData));
-      const cookie = serialize('session', encryptedSessionData, {
-        httpOnly: true,
-        sameSite: "strict",
-        secure: process.env.NODE_ENV === 'production',
-        maxAge: 60 * 60 * 24 * 7, // One week
-        path: '/',
-      });
-      request.headers.set('Set-Cookie', cookie);
+      try {
+        const newAuth: TokenData = await refreshAccessToken(refresh_token);
+        currentToken = newAuth.access_token;
+        
+        // Preserve all existing session data and only update token-related fields
+        const updatedSessionData: SessionData = {
+          ...parsedSessionData,
+          access_token: newAuth.access_token,
+          refresh_token: newAuth.refresh_token,
+          expires_in: newAuth.expires_in,
+          expiry_date: new Date(new Date().getTime() + newAuth.expires_in * 1000).toISOString(),
+        };
+        
+        const encryptedSessionData = await encrypt(JSON.stringify(updatedSessionData));
+        const cookie = serialize('session', encryptedSessionData, {
+          httpOnly: true,
+          sameSite: "strict",
+          secure: process.env.NODE_ENV === 'production',
+          maxAge: 60 * 60 * 24 * 7, // One week
+          path: '/',
+        });
+        request.headers.set('Set-Cookie', cookie);
+      } catch (refreshError) {
+        console.error('Failed to refresh token:', refreshError);
+        return false;
+      }
     }
 
     const isTokenValid = await verifyJWT(currentToken);
     if (!isTokenValid) {
+      console.warn('Invalid JWT token');
       return false;
     }
     
     const route = PROTECTED_ROUTES.find(route => url.pathname.startsWith(route.path));
+    if (!route) {
+      console.warn('No matching route found for path:', url.pathname);
+      return false;
+    }
 
-    const userRoles = user_roles.split(',').map(Number);
-    const userGroups = user_groups.split(',').map(Number);
+    // Handle empty user roles/groups gracefully
+    const userRoles = user_roles ? user_roles.split(',').filter(Boolean).map(Number) : [];
+    const userGroups = user_groups ? user_groups.split(',').filter(Boolean).map(Number) : [];
 
-    const isUserInRequiredRole = userRoles.some((role: number) => route?.requiredRoleID.includes(role));
-    const isUserInRequiredGroup = userGroups.some((group: number) => route?.requiredGroupID.includes(group));
+    const isUserInRequiredRole = route.requiredRoleID.length === 0 || 
+      userRoles.some((role: number) => route.requiredRoleID.includes(role));
+    const isUserInRequiredGroup = route.requiredGroupID.length === 0 || 
+      userGroups.some((group: number) => route.requiredGroupID.includes(group));
 
     if (isUserInRequiredRole || isUserInRequiredGroup) {
       return true;
     }
     
+    console.warn('User does not have required permissions for route:', url.pathname);
     return false;
   } catch (error) {
-    // console.error('Failed to check session:', error);
+    console.error('Failed to check session:', {
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+      path: url.pathname
+    });
     return false;
   }
 }

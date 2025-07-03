@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { serialize } from 'cookie';
 import { encrypt } from '@/app/lib/encryption';
 import { User } from '@/app/lib/oauth';
+import { handleError, ValidationError, OAuthError } from '@/app/lib/errors';
 
 export async function GET(request: NextRequest) {
     try {
@@ -11,7 +12,7 @@ export async function GET(request: NextRequest) {
         const state = request.nextUrl.searchParams.get('state');
 
         if (!code) {
-            return redirect('/error?msg=No code provided');
+            throw new ValidationError('Authorization code is required');
         }
 
         // Extract returnTo from state parameter
@@ -21,6 +22,7 @@ export async function GET(request: NextRequest) {
                 const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
                 returnTo = stateData.returnTo || '/';
             } catch (error) {
+                console.warn('Failed to parse state parameter, using default returnTo');
                 returnTo = '/';
             }
         }
@@ -30,6 +32,10 @@ export async function GET(request: NextRequest) {
         const tokenData = await getToken(code, redirectUri);
 
         const { token_type, access_token, refresh_token, expires_in } = tokenData;
+
+        if (!access_token) {
+            throw new OAuthError('Failed to obtain access token');
+        }
 
         const user: User = await getUser(token_type, access_token);
         const roles: UserRoles = await getUserRoles(user);
@@ -43,7 +49,6 @@ export async function GET(request: NextRequest) {
             user_roles: roles.user_roles ?? '',
             user_groups: roles.user_groups ?? ''
         });
-
 
         const encryptedSessionData = await encrypt(sessionData);
 
@@ -59,6 +64,23 @@ export async function GET(request: NextRequest) {
         response.headers.set('Set-Cookie', cookie);
         return response;
     } catch (error) {
-        return redirect('/error?msg=Error in login callback');
+        const appError = handleError(error);
+        
+        // Log the error for debugging
+        console.error('Login callback error:', {
+            message: appError.message,
+            statusCode: appError.statusCode,
+            stack: appError.stack,
+            url: request.url
+        });
+
+        // Redirect to error page with appropriate message
+        const errorMessage = appError instanceof ValidationError 
+            ? 'Invalid authorization request'
+            : appError instanceof OAuthError
+            ? 'Authentication service error'
+            : 'Login failed';
+            
+        return redirect(`/error?msg=${encodeURIComponent(errorMessage)}`);
     }
 }
